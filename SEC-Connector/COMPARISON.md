@@ -32,7 +32,7 @@ Residual HTML tags hurt semantic search because the search engine must decide wh
 
 | | PowerShell | Python |
 |---|---|---|
-| Size validation | None — a large filing section becomes one Graph item, potentially exceeding the **4 MB hard limit** | `enforce_size_limit()` checks every chunk against 4 MB; oversized chunks are recursively split |
+| Size validation | No explicit request-envelope validation in the earlier implementation | Bounded UTF-8 chunks plus final serialized-request validation against the configured 30 MiB ceiling |
 | Chunk sizing | Splits only on page boundaries; pages can be arbitrarily large or small | Target ~4,000 chars with fallback splitting |
 | Overlap | None — page boundaries are hard cuts | 200-char overlap ensures search queries hitting chunk boundaries still find relevant context |
 

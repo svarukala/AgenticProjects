@@ -3,14 +3,14 @@
 import re
 from typing import Optional
 
-from .config import ChunkingConfig
-from .models import ContentChunk, DocumentInfo, FilingMetadata, ParsedDocument
+from .config import GRAPH_MAX_ITEM_BYTES, ChunkingConfig
+from .models import ContentChunk, ParsedDocument
 from .utils import get_logger
 
 logger = get_logger("chunker")
 
 PAGE_MARKER = "---PAGE---"
-MAX_CHUNK_BYTES = 4 * 1024 * 1024  # 4 MB hard limit
+MAX_CHUNK_BYTES = GRAPH_MAX_ITEM_BYTES
 
 
 def estimate_size_bytes(text: str) -> int:
@@ -77,49 +77,24 @@ def split_by_size(
     Returns:
         List of chunks
     """
-    if len(content) <= max_size:
-        return [content]
+    if not 0 < target_size <= max_size or not 0 <= overlap < target_size:
+        raise ValueError("Require 0 < target_size <= max_size and 0 <= overlap < target_size")
+    return _split_content(content, target_size, max_size, overlap, MAX_CHUNK_BYTES)
 
+
+def _split_prose(content: str, target_size: int, max_size: int, overlap: int) -> list[str]:
     chunks = []
-    paragraphs = re.split(r"\n\n+", content)
-
-    current_chunk = ""
-
-    for para in paragraphs:
-        if len(current_chunk) + len(para) + 2 <= target_size:
-            current_chunk += ("\n\n" if current_chunk else "") + para
-        else:
-            if current_chunk:
-                chunks.append(current_chunk)
-
-                if overlap > 0 and len(current_chunk) > overlap:
-                    overlap_text = current_chunk[-overlap:]
-                    last_space = overlap_text.rfind(" ")
-                    if last_space > 0:
-                        overlap_text = overlap_text[last_space + 1:]
-                    current_chunk = overlap_text + "\n\n" + para
-                else:
-                    current_chunk = para
-            else:
-                if len(para) <= max_size:
-                    chunks.append(para)
-                    current_chunk = ""
-                else:
-                    words = para.split()
-                    temp = ""
-                    for word in words:
-                        if len(temp) + len(word) + 1 <= target_size:
-                            temp += (" " if temp else "") + word
-                        else:
-                            if temp:
-                                chunks.append(temp)
-                            temp = word
-                    if temp:
-                        current_chunk = temp
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
+    start = 0
+    while len(content) - start > max_size:
+        end = start + target_size
+        boundary = content.rfind("\n\n", start + target_size // 2, end)
+        if boundary < 0:
+            boundary = content.rfind(" ", start + target_size // 2, end)
+        if boundary >= 0:
+            end = boundary + 1
+        chunks.append(content[start:end])
+        start = max(start + 1, end - overlap)
+    chunks.append(content[start:])
     return chunks
 
 
@@ -133,14 +108,127 @@ def enforce_size_limit(content: str, max_bytes: int = MAX_CHUNK_BYTES) -> list[s
     Returns:
         List of chunks within size limit
     """
-    current_size = estimate_size_bytes(content)
+    if max_bytes < 4:
+        raise ValueError("max_bytes must accommodate a four-byte UTF-8 character")
+    encoded = content.encode("utf-8")
+    chunks = []
+    offset = 0
+    while offset < len(encoded):
+        # Ignore only an incomplete code point at this boundary, then consume
+        # its full bytes on the next iteration.
+        piece = encoded[offset:offset + max_bytes].decode("utf-8", errors="ignore")
+        chunks.append(piece)
+        offset += len(piece.encode("utf-8"))
+    return chunks or [""]
 
-    if current_size <= max_bytes:
-        return [content]
 
-    target_chars = int(len(content) * (max_bytes * 0.9) / current_size)
+def _fits(text: str, max_size: int, max_bytes: int) -> bool:
+    return len(text) <= max_size and estimate_size_bytes(text) <= max_bytes
 
-    return split_by_size(content, target_chars, target_chars, overlap=0)
+
+def _bounded_fragments(text: str, max_size: int, max_bytes: int) -> list[str]:
+    return [
+        piece
+        for offset in range(0, len(text), max_size)
+        for piece in enforce_size_limit(text[offset:offset + max_size], max_bytes)
+    ]
+
+
+def _split_table(
+    table: str, context: str, target_size: int, max_size: int, max_bytes: int
+) -> list[str]:
+    rows = table.splitlines()
+    header_count = 2 if len(rows) > 1 and re.fullmatch(r"\|(?:\s*:?-+:?\s*\|)+\s*", rows[1]) else 0
+    header = "\n".join(rows[:header_count])
+    data = rows[header_count:]
+    prefix = "\n\n".join(part for part in (context, header) if part)
+    if prefix:
+        prefix += "\n"
+    # A huge header/context is content too; emit it bounded rather than drop it
+    # or reserve so much space that no code point of a data row can progress.
+    if not _fits(prefix + "😀", max_size, max_bytes):
+        logger.warning("Table header/context exceeds chunk budget; using bounded fragments")
+        return _bounded_fragments(context + ("\n\n" if context else "") + table, max_size, max_bytes)
+    if not data:
+        return [prefix.rstrip("\n")] if prefix else []
+
+    chunks = []
+    current = prefix
+    has_rows = False
+    for row in data:
+        addition = row + "\n"
+        if has_rows and (
+            not _fits(current + addition, max_size, max_bytes)
+            or len(current + addition) > target_size
+        ):
+            chunks.append(current.rstrip("\n"))
+            current, has_rows = prefix, False
+        if not _fits(prefix + addition, max_size, max_bytes):
+            if has_rows:
+                chunks.append(current.rstrip("\n"))
+                current, has_rows = prefix, False
+            logger.warning("Indivisible table row exceeds chunk budget; preserving ordered row fragments")
+            warning = "[Table row fragment; concatenate in chunk order]\n"
+            fragment_prefix = prefix + warning
+            if not _fits(fragment_prefix + "😀", max_size, max_bytes):
+                fragment_prefix = prefix
+            for piece in _bounded_fragments(
+                row, max_size - len(fragment_prefix),
+                max_bytes - estimate_size_bytes(fragment_prefix),
+            ):
+                chunks.append(fragment_prefix + piece)
+        else:
+            current += addition
+            has_rows = True
+    if has_rows:
+        chunks.append(current.rstrip("\n"))
+    return chunks
+
+
+def _split_content(
+    content: str, target_size: int, max_size: int, overlap: int, max_bytes: int
+) -> list[str]:
+    """Keep table rows atomic; apply overlap exclusively to prose blocks."""
+    blocks = re.split(r"(^[ \t]*\|[^\n]*(?:\n[ \t]*\|[^\n]*)*)", content, flags=re.MULTILINE)
+    if len(blocks) == 1:
+        return [
+            part for piece in _split_prose(content, target_size, max_size, overlap)
+            for part in enforce_size_limit(piece, max_bytes)
+        ]
+    chunks = []
+    for index, block in enumerate(blocks):
+        if not block.strip():
+            continue
+        if index % 2:
+            # Financial captions and units commonly occupy the immediately
+            # preceding short paragraphs. Keep them with every table segment.
+            paragraphs = re.split(r"\n\s*\n", blocks[index - 1].strip())
+            nearby = []
+            for paragraph in reversed(paragraphs):
+                if not paragraph or len(paragraph) > 240:
+                    break
+                nearby.insert(0, paragraph)
+                if len(nearby) == 3:
+                    break
+            following = blocks[index + 1].strip() if index + 1 < len(blocks) else ""
+            notes = []
+            for paragraph in re.split(r"\n\s*\n", following):
+                if len(paragraph) <= 240 and re.match(r"^(?:\(\d+\)|\[\d+\]|\*|Notes?\b)", paragraph):
+                    notes.append(paragraph)
+                else:
+                    break
+            context = "\n\n".join(nearby + notes)
+            # Do not let optional neighboring prose make otherwise valid rows
+            # indivisible. It remains present in its own prose block.
+            if not _fits(context, max_size // 3, max(4, max_bytes // 3)):
+                context = ""
+            chunks.extend(_split_table(block.strip(), context, target_size, max_size, max_bytes))
+        else:
+            chunks.extend(
+                part for piece in _split_prose(block, target_size, max_size, overlap)
+                for part in enforce_size_limit(piece, max_bytes)
+            )
+    return chunks
 
 
 def chunk_document(
@@ -163,22 +251,36 @@ def chunk_document(
     chunks = []
 
     pages = split_by_pages(content)
-
-    if len(pages) <= 1:
-        pages = split_by_sections(content)
-
-    if len(pages) <= 1:
-        pages = split_by_size(
-            content,
-            config.target_size,
-            config.max_size,
-            config.overlap,
-        )
-
+    section_title = None
     for page_num, page_content in enumerate(pages, start=1):
-        sub_chunks = enforce_size_limit(page_content, config.max_item_bytes)
+        sub_chunks = []
+        for section in split_by_sections(page_content):
+            heading = re.match(r"^#{1,3}\s+(.+)", section)
+            if heading:
+                section_title = re.sub(r"[*_]", "", heading.group(1)).strip()
+            report_period = filing.report_period_end
+            context_parts = [filing.company_name, filing.form]
+            if report_period:
+                context_parts.append(f"Report period: {report_period:%Y-%m-%d}")
+            if section_title:
+                context_parts.append(f"Section: {section_title}")
+            compact_parts = []
+            for part in context_parts:
+                candidate = " | ".join(compact_parts + [part]) + "\n\n"
+                if _fits(candidate, config.max_size // 4, config.max_item_bytes // 4):
+                    compact_parts.append(part)
+            context = " | ".join(compact_parts) + "\n\n" if compact_parts else ""
+            char_budget = config.max_size - len(context)
+            byte_budget = config.max_item_bytes - estimate_size_bytes(context)
+            target = min(config.target_size, char_budget)
+            overlap = min(config.overlap, target - 1)
+            sub_chunks.extend(
+                (context + piece, section_title)
+                for piece in _split_content(section, target, char_budget, overlap, byte_budget)
+                if piece
+            )
 
-        for sub_idx, sub_content in enumerate(sub_chunks):
+        for sub_idx, (sub_content, chunk_section) in enumerate(sub_chunks):
             actual_page = page_num if len(sub_chunks) == 1 else f"{page_num}.{sub_idx + 1}"
 
             chunk_id = f"{filing.cik}-{filing.accession_no_dashes}-{document.sequence}-p{actual_page}"
@@ -192,6 +294,9 @@ def chunk_document(
                 filing=filing,
                 document=document,
                 page_number=page_num,
+                subchunk_number=sub_idx + 1 if len(sub_chunks) > 1 else None,
+                chunk_ordinal=len(chunks) + 1,
+                section_title=chunk_section,
                 content=sub_content,
                 title=title,
             )

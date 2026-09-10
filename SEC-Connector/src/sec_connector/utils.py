@@ -1,7 +1,9 @@
 """Utility functions for logging and retry logic."""
 
+import asyncio
 import logging
-import sys
+import math
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, TypeVar
@@ -64,7 +66,7 @@ def retry_with_backoff(
 
 
 class RateLimiter:
-    """Simple rate limiter using token bucket algorithm."""
+    """Serialize admissions with monotonic pacing, without a token burst."""
 
     def __init__(self, rate: float):
         """Initialize rate limiter.
@@ -72,25 +74,19 @@ class RateLimiter:
         Args:
             rate: Maximum requests per second
         """
+        if not math.isfinite(rate) or rate <= 0:
+            raise ValueError("Rate must be a finite positive number")
         self.rate = rate
-        self.tokens = rate
-        self.last_update = datetime.now()
+        self._interval = 1.0 / rate
+        self._lock = asyncio.Lock()
+        self._next_request = 0.0
 
     async def acquire(self) -> None:
-        """Acquire a token, waiting if necessary."""
-        import asyncio
-
-        now = datetime.now()
-        elapsed = (now - self.last_update).total_seconds()
-        self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
-        self.last_update = now
-
-        if self.tokens < 1:
-            wait_time = (1 - self.tokens) / self.rate
-            await asyncio.sleep(wait_time)
-            self.tokens = 0
-        else:
-            self.tokens -= 1
+        """Admit one request; concurrent callers cannot reserve the same slot."""
+        async with self._lock:
+            while (delay := self._next_request - time.monotonic()) > 0:
+                await asyncio.sleep(delay)
+            self._next_request = time.monotonic() + self._interval
 
 
 def format_size(size_bytes: int) -> str:
