@@ -19,16 +19,18 @@
     {
       "name": "Ticker",
       "type": "String",
-      "isSearchable": true,
+      "isSearchable": false,
       "isQueryable": true,
-      "isRetrievable": true
+      "isRetrievable": true,
+      "isRefinable": true
     },
     {
       "name": "Form",
       "type": "String",
-      "isSearchable": true,
+      "isSearchable": false,
       "isQueryable": true,
-      "isRetrievable": true
+      "isRetrievable": true,
+      "isRefinable": true
     },
     {
       "name": "FilingDate",
@@ -63,7 +65,7 @@
       "name": "AccessionNumber",
       "type": "String",
       "isSearchable": false,
-      "isQueryable": false,
+      "isQueryable": true,
       "isRetrievable": true
     },
     {
@@ -78,6 +80,77 @@
       "type": "Int64",
       "isSearchable": false,
       "isQueryable": false,
+      "isRetrievable": true
+    },
+    {
+      "name": "IconUrl",
+      "type": "String",
+      "isRetrievable": true,
+      "labels": ["iconUrl"]
+    },
+    {
+      "name": "FilingUrl",
+      "type": "String",
+      "isRetrievable": true
+    },
+    {
+      "name": "DocumentName",
+      "type": "String",
+      "isSearchable": true,
+      "isQueryable": true,
+      "isRetrievable": true,
+      "labels": ["fileName"]
+    },
+    {
+      "name": "FileExtension",
+      "type": "String",
+      "isQueryable": true,
+      "isRetrievable": true,
+      "labels": ["fileExtension"]
+    },
+    {
+      "name": "DocumentType",
+      "type": "String",
+      "isQueryable": true,
+      "isRetrievable": true,
+      "isRefinable": true
+    },
+    {
+      "name": "DocumentId",
+      "type": "String",
+      "isQueryable": true,
+      "isRetrievable": true
+    },
+    {
+      "name": "ChunkOrdinal",
+      "type": "Int64",
+      "isQueryable": true,
+      "isRetrievable": true
+    },
+    {
+      "name": "SectionTitle",
+      "type": "String",
+      "isSearchable": true,
+      "isQueryable": true,
+      "isRetrievable": true
+    },
+    {
+      "name": "ReportPeriodEnd",
+      "type": "DateTime",
+      "isQueryable": true,
+      "isRetrievable": true
+    },
+    {
+      "name": "AcceptanceDateTime",
+      "type": "DateTime",
+      "isQueryable": true,
+      "isRetrievable": true,
+      "labels": ["createdDateTime"]
+    },
+    {
+      "name": "IsAmendment",
+      "type": "Boolean",
+      "isQueryable": true,
       "isRetrievable": true
     }
   ]

@@ -3,6 +3,7 @@
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -15,6 +16,8 @@ class FilingState(str, Enum):
     UPLOADED = "uploaded"
     COMPLETED = "completed"
     FAILED = "failed"
+    SAMPLED = "sampled"
+    RETIRING = "retiring"
 
 
 class ChunkState(str, Enum):
@@ -34,6 +37,22 @@ class FilingMetadata(BaseModel):
     ticker: str
     primary_document: Optional[str] = None
     file_number: Optional[str] = None
+    report_period_end: Optional[datetime] = None
+    acceptance_datetime: Optional[datetime] = None
+
+    @property
+    def is_amendment(self) -> bool:
+        return self.form.endswith("/A")
+
+    @property
+    def filing_url(self) -> str:
+        return self.document_url(f"{self.accession_number}-index.html")
+
+    def document_url(self, filename: str) -> str:
+        return (
+            f"https://www.sec.gov/Archives/edgar/data/{self.cik}/"
+            f"{self.accession_no_dashes}/{quote(filename, safe='/')}"
+        )
 
     @property
     def accession_formatted(self) -> str:
@@ -48,7 +67,7 @@ class FilingMetadata(BaseModel):
     @property
     def sec_url(self) -> str:
         """Return the SEC EDGAR URL for this filing."""
-        return f"https://www.sec.gov/Archives/edgar/data/{self.cik}/{self.accession_no_dashes}/{self.primary_document or 'index.html'}"
+        return self.document_url(self.primary_document) if self.primary_document else self.filing_url
 
 
 class DocumentInfo(BaseModel):
@@ -84,13 +103,19 @@ class ContentChunk(BaseModel):
     filing: FilingMetadata
     document: DocumentInfo
     page_number: int
+    subchunk_number: Optional[int] = None
+    chunk_ordinal: int = 1
+    section_title: Optional[str] = None
     content: str
     title: str
 
     @property
     def graph_item_id(self) -> str:
         """Generate a unique ID for the Graph external item."""
-        return f"{self.filing.cik}-{self.filing.accession_no_dashes}-{self.document.sequence}-{self.page_number}"
+        item_id = f"{self.filing.cik}-{self.filing.accession_no_dashes}-{self.document.sequence}-{self.page_number}"
+        if self.subchunk_number is not None:
+            item_id += f"-{self.subchunk_number}"
+        return item_id
 
 
 class GraphExternalItem(BaseModel):
@@ -116,6 +141,14 @@ class FilingRecord(BaseModel):
     company_name: str
     form: str
     filing_date: datetime
+    primary_document: Optional[str] = None
+    file_number: Optional[str] = None
+    report_period_end: Optional[datetime] = None
+    acceptance_datetime: Optional[datetime] = None
+    inventory_complete: bool = False
+    payloads_ready: bool = False
+    sample_limit: Optional[int] = None
+    processing_options: dict = Field(default_factory=dict)
     state: FilingState = FilingState.PENDING
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -131,5 +164,6 @@ class ChunkRecord(BaseModel):
     sequence: int
     state: ChunkState = ChunkState.PENDING
     error_message: Optional[str] = None
+    payload: Optional[dict] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

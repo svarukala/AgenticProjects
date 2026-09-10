@@ -26,7 +26,7 @@ C:\vibe\SEC-Connector\
 ├── data/                       # Runtime data (gitignored)
 │   ├── downloads/              # Cached SEC filings
 │   ├── payloads/               # Saved upload payloads (--save-payloads)
-│   ├── state.db                # Processing state
+│   ├── state.<destination>.db  # Tenant/connection-scoped processing state
 │   └── logs/                   # Log files
 └── tests/
 ```
@@ -35,10 +35,10 @@ C:\vibe\SEC-Connector\
 
 ### 1. SEC EDGAR Client (`sec_client.py`)
 - Ticker-to-CIK mapping via `sec.gov/files/company_tickers.json`
-- Fetch filing metadata from `data.sec.gov/submissions/CIK{cik}.json`
+- Fetch recent and historical submissions, including amendments and configured date bounds
 - **Download raw filings to `data/downloads/{cik}/{accession}/`**
-- Skip already-downloaded files (cache check)
-- Rate limiting (10 req/sec) with retry logic
+- Refresh source bytes by default; cache parsed payloads by source and configuration fingerprint
+- Shared request/retry pacing (at most 10 req/sec per client)
 
 ### Processing Pipeline
 ```
@@ -46,23 +46,38 @@ C:\vibe\SEC-Connector\
 2. DOWNLOAD  → Save raw .txt/.htm files to data/downloads/ (cached)
 3. PARSE     → Extract content from disk, convert to Markdown
 4. CHUNK     → Split into LLM-friendly segments
-5. UPLOAD    → Batch upload to Microsoft Graph
+5. UPLOAD    → Bounded individual PUTs for new/changed payloads
+6. RECONCILE → Delete stale tracked items only after complete desired delivery
 ```
-Each stage checkpoints to SQLite - resume from any failure point.
+SQLite stores the discovered inventory, document outcomes, captured chunking/OCR
+settings, and exact desired upload payloads. Resume retries unprepared documents
+and replays prepared payloads without reparsing them.
+
+Increment `pipeline.PROCESSING_VERSION` when parser, chunker, or payload
+transformation semantics change. Completed filings then invalidate their parse
+cache. Ordinary resume keeps already prepared payloads replayable. To rebuild
+in-flight filings after an upgrade, stop the writer and use
+`ingest -t TICKER --reprocess` with the intended date scope. This explicitly
+replaces captured processing settings while preserving acknowledged and
+potentially delivered old IDs for upload-before-delete reconciliation.
 
 ### 2. Document Parser (`parser.py`)
 - Parse SGML structure (`<DOCUMENT>`, `<TEXT>`, headers)
 - Extract metadata (company, form, date, accession number)
-- HTML-to-Markdown conversion pipeline (20+ transformations)
+- Span-aware financial tables, hidden inline-XBRL removal, and literal-text preservation
+- Collapse visual columns only when they share source cells across populated rows;
+  independent equal financial values remain separate. Body colspans use
+  `[merged with column N]` within the same row instead of repeating disclosures.
+- Infer short period headers without promoting year-containing narrative rows.
 - Filter by file type (.htm, .txt only)
 
 ### 3. Content Chunker (`chunker.py`)
-- **Max item size**: 4 MB per Graph external item (hard limit enforced)
+- **Max item size**: 30 MiB (31,457,280 bytes), enforced on the serialized Graph request
 - Page-based splitting (primary) using `<PAGE>` markers
 - Section header splitting (secondary)
-- Size-based fallback (3000-4000 chars target, ~4KB well under 4MB)
+- Size-based fallback (3000-4000 chars target, well below the request ceiling)
 - 200-char overlap for context continuity
-- Validation: reject/split any chunk exceeding 4 MB
+- Validation: bounded UTF-8 splitting and final serialized-body validation
 
 > **FYI — Chunking Size Defaults**
 >
@@ -71,20 +86,20 @@ Each stage checkpoints to SQLite - resume from any failure point.
 > | `target_size` | 4,000 chars | Ideal chunk size for splitting |
 > | `max_size` | 8,000 chars | Upper limit before forced split |
 > | `overlap` | 200 chars | Context overlap between chunks |
-> | `max_item_bytes` | 4,194,304 (4 MB) | Hard limit per Graph external item |
+> | `max_item_bytes` | 31,457,280 (30 MiB) | Maximum serialized external-item request |
 >
-> Chunking priority: page markers → section headers → size-based fallback. Any chunk exceeding 4 MB is further split by `enforce_size_limit`.
+> Chunking priority: page markers → section headers → size-based fallback. All boundaries are size-checked; byte subchunks receive unique Graph IDs. JSON/metadata overhead is checked before sending.
 
 ### 4. State Manager (`state_manager.py`)
-- SQLite database for tracking: `filings` and `chunks` tables
-- State machine: PENDING → DOWNLOADED → PARSED → UPLOADED → COMPLETED
+- Destination-bound SQLite manifests, delivered-item hashes, document cache, and durable run history
+- Filing outcomes: pending/failed → parsed → completed (or sampled); document rows track downloads and parsing separately
 - Resume capability: pick up from any failed state
-- Checkpoint after each batch upload
+- Prepared document payloads commit atomically; acknowledged uploads checkpoint individually
 
 ### 5. Graph Client (`graph_client.py`)
 - MSAL authentication (client credentials flow)
 - Connection and schema management
-- Batch uploads (20 items per request)
+- Bounded individual PUTs (up to five concurrently), with exact serialized-request size checks
 - Exponential backoff for 429 rate limits
 
 ### 6. CLI Interface (`cli.py`)
@@ -102,6 +117,9 @@ sec-connector ingest -t AAPL,MSFT,GOOG --save-payloads
 # Resume interrupted processing
 sec-connector resume
 
+# Rebuild selected filings with upgraded parsing, including interrupted manifests
+sec-connector ingest -t AAPL --reprocess
+
 # Resume with payload saving
 sec-connector resume --save-payloads
 
@@ -114,8 +132,8 @@ sec-connector status
 |----------|------|------------|-----------|---------|
 | Title | String | ✓ | ✓ | "Company - Form - Date" |
 | Company | String | ✓ | ✓ | Company name |
-| Ticker | String | ✓ | ✓ | Stock symbol |
-| Form | String | ✓ | ✓ | 10-K, 10-Q, etc. |
+| Ticker | String | | ✓ | Refinable stock symbol |
+| Form | String | | ✓ | Refinable form |
 | FilingDate | DateTime | | ✓ | Filing date |
 | Description | String | ✓ | | Document description |
 | Url | String | | | SEC EDGAR link |
@@ -123,6 +141,27 @@ sec-connector status
 | AccessionNumber | String | | | Unique filing ID |
 | Sequence | Int64 | | | Doc sequence |
 | Page | Int64 | | | Page/chunk number |
+| IconUrl | String | | | iconUrl semantic label |
+| FilingUrl | String | | | Filing index citation |
+| DocumentName | String | ✓ | ✓ | fileName semantic label |
+| FileExtension | String | | ✓ | fileExtension semantic label |
+| DocumentType | String | | ✓ | Refinable primary/exhibit type |
+| DocumentId | String | | ✓ | Stable document grouping ID |
+| ChunkOrdinal | Int64 | | ✓ | Ordering within the document |
+| SectionTitle | String | ✓ | ✓ | Genuine source heading |
+| ReportPeriodEnd | DateTime | | ✓ | Fiscal reporting date |
+| AcceptanceDateTime | DateTime | | ✓ | createdDateTime semantic label |
+| IsAmendment | Boolean | | ✓ | Amendment flag |
+
+The schema uses stable Graph v1.0. Requests include
+`Prefer: include-unknown-enum-members` so `iconUrl` round-trips correctly.
+The beta-only `isExactMatchRequired` property is deliberately not used.
+Use a new connection for a populated schema change.
+
+Full reruns refresh completed filings and skip unchanged PUTs. Samples never
+delete full content. Whole-filing pruning is opt-in and requires an unlimited
+historical inventory without date bounds; failures block pruning. Resume includes
+failed deletions and partially retired filings.
 
 ## Dependencies
 - **click** + **rich**: CLI with progress bars
@@ -163,7 +202,7 @@ sec-connector status
 ## Configuration (config/config.yaml)
 ```yaml
 sec:
-  user_agent: "SEC-Connector/1.0 (your-email@example.com)"
+  user_agent: ${SEC_USER_AGENT}
   rate_limit: 10
 
 azure:
@@ -217,7 +256,7 @@ Residual HTML tags hurt semantic search because the search engine must decide wh
 
 | | PowerShell | Python |
 |---|---|---|
-| Size validation | None — a large filing section becomes one Graph item, potentially exceeding the **4 MB hard limit** | `enforce_size_limit()` checks every chunk against 4 MB; oversized chunks are recursively split |
+| Size validation | No explicit request-envelope validation in the earlier implementation | Bounded UTF-8 chunks plus final serialized-request validation against the configured 30 MiB ceiling |
 | Chunk sizing | Splits only on page boundaries; pages can be arbitrarily large or small | Target ~4,000 chars with fallback splitting |
 | Overlap | None — page boundaries are hard cuts | 200-char overlap ensures search queries hitting chunk boundaries still find relevant context |
 

@@ -4,13 +4,29 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString
 from markdownify import MarkdownConverter
+from soupsieve import SelectorSyntaxError
 
 from .models import DocumentInfo, FilingMetadata, ParsedDocument
 from .utils import get_logger
 
 logger = get_logger("parser")
+
+
+def _is_period_heading(value: str) -> bool:
+    """Recognize short date labels, not narrative sentences that mention years."""
+    if len(value) > 100 or not re.search(r"\b(?:19|20)\d{2}\b", value):
+        return False
+    remainder = re.sub(r"\b(?:19|20)\d{2}\b", "", value.lower())
+    remainder = re.sub(
+        r"\b(?:january|february|march|april|may|june|july|august|september|october|november|december"
+        r"|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+        r"|fiscal|years?|quarters?|months?|weeks?|ended|ending|as|at|of|and|the|three|six|nine|twelve|q[1-4])\b",
+        "", remainder,
+    )
+    remainder = re.sub(r"\b(?:[0-2]?\d|3[01])\b", "", remainder)
+    return not re.search(r"\w", remainder)
 
 
 def _parse_dimension_inches(el) -> tuple[Optional[float], Optional[float]]:
@@ -63,40 +79,143 @@ class SECMarkdownConverter(MarkdownConverter):
     """Custom markdown converter for SEC filings."""
 
     def convert_table(self, el, text=None, *args, **kwargs):
-        """Convert tables to markdown format."""
-        rows = el.find_all("tr")
+        """Normalize direct cells into a grid without counting nested descendants."""
+        rows = [row for row in el.find_all("tr") if row.find_parent("table") is el]
         if not rows:
             return text or ""
 
-        md_rows = []
-        header_processed = False
+        direct_cells = [
+            [cell for cell in row.find_all(["th", "td"])
+             if cell.find_parent("tr") is row and cell.find_parent("table") is el]
+            for row in rows
+        ]
+        if el.find("table") or el.get("role") == "presentation" or all(
+            len(cells) <= 1 and not any(cell.get("colspan") for cell in cells)
+            for cells in direct_cells
+        ):
+            # Layout wrappers must not turn their embedded financial tables into
+            # escaped pipes, nor include the inner cells a second time.
+            return "\n\n" + "\n\n".join(
+                self.convert(cell.decode_contents()).strip()
+                for cells in direct_cells for cell in cells
+            ) + "\n\n"
 
-        for row in rows:
-            cells = row.find_all(["th", "td"])
-            if not cells:
-                continue
-
-            cell_texts = []
+        grid = {}
+        origins = {}
+        header_flags = []
+        title_flags = []
+        for row_index, cells in enumerate(direct_cells):
+            column = 0
+            header_flags.append(bool(cells) and (
+                all(cell.name == "th" and cell.get("scope") != "row" for cell in cells)
+                or rows[row_index].find_parent("thead") is not None
+            ))
+            title_flags.append(len(cells) == 1 and cells[0].has_attr("colspan"))
             for cell in cells:
-                cell_text = self.convert(str(cell)).strip()
-                cell_text = cell_text.replace("|", "\\|")
-                cell_text = " ".join(cell_text.split())
-                cell_texts.append(cell_text)
+                while (row_index, column) in grid:
+                    column += 1
+                value = " ".join(self.convert(cell.decode_contents()).split())
+                value = value.replace("|", "\\|")
+                try:
+                    # Bound malformed spans to avoid unbounded allocation.
+                    rowspan = int(cell.get("rowspan", 1))
+                    if rowspan == 0:
+                        rowspan = len(rows) - row_index
+                    rowspan = min(max(rowspan, 1), len(rows) - row_index)
+                    colspan = min(max(int(cell.get("colspan", 1)), 1), 256)
+                except (ValueError, TypeError):
+                    rowspan = colspan = 1
+                for down in range(rowspan):
+                    for across in range(colspan):
+                        grid.setdefault((row_index + down, column + across), value)
+                        origins.setdefault((row_index + down, column + across), (row_index, column))
+                column += colspan
 
-            md_rows.append("| " + " | ".join(cell_texts) + " |")
+        width = max((column for _, column in grid), default=0) + 1
+        populated_rows = [
+            row for row in range(len(rows))
+            if any(grid.get((row, col), "") for col in range(width))
+        ]
+        # Collapse only columns covered by the same source cell in every row.
+        # Equal-looking values in independent financial columns must stay separate.
+        columns = [
+            col for col in range(width)
+            if col == 0 or any(
+                origins.get((row, col)) != origins.get((row, col - 1))
+                for row in populated_rows
+            )
+        ]
+        matrix = [[grid.get((row, col), "") for col in columns] for row in range(len(rows))]
+        origin_matrix = [[origins.get((row, col)) for col in columns] for row in range(len(rows))]
+        width = len(columns)
+        # SEC layout exports often interleave many completely empty spacer rows.
+        populated = [index for index, values in enumerate(matrix) if any(values)]
+        matrix = [matrix[index] for index in populated]
+        origin_matrix = [origin_matrix[index] for index in populated]
+        header_flags = [header_flags[index] for index in populated]
+        title_flags = [title_flags[index] for index in populated]
+        if not matrix:
+            return text or ""
+        caption = el.find("caption", recursive=False)
+        context = [self.convert(caption.decode_contents()).strip()] if caption else []
+        # Full-width title/unit rows are context, not misleading column names.
+        while matrix and title_flags[0] and len(set(matrix[0])) == 1 and matrix[0][0]:
+            context.append(matrix.pop(0)[0])
+            origin_matrix.pop(0)
+            header_flags.pop(0)
+            title_flags.pop(0)
 
-            if not header_processed and (row.find("th") or len(md_rows) == 1):
-                separator = "| " + " | ".join(["---"] * len(cells)) + " |"
-                md_rows.append(separator)
-                header_processed = True
+        header_count = 0
+        for values, explicit in zip(matrix, header_flags):
+            nonempty = [re.sub(r"[*_]", "", value) for value in values if value]
+            periods = any(_is_period_heading(value) for value in nonempty)
+            numeric = any(re.fullmatch(r"[$(−\-]?\d[\d,.% )]*", value) for value in nonempty)
+            short_labels = all(len(value) <= 120 for value in nonempty)
+            heading_labels = short_labels and all(
+                not re.search(r"\d", value) or _is_period_heading(value)
+                for value in nonempty
+            )
+            first_labels = short_labels and not numeric and all(
+                not re.search(r"\b(?:19|20)\d{2}\b", value) or _is_period_heading(value)
+                for value in nonempty
+            )
+            if explicit or (heading_labels and periods) or (header_count == 0 and first_labels):
+                header_count += 1
+            else:
+                break
+        headers = []
+        for column in range(width):
+            labels = list(dict.fromkeys(row[column] for row in matrix[:header_count] if row[column]))
+            headers.append(" / ".join(labels))
+        md_rows = [
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join(["---"] * width) + " |",
+        ]
+        for values, source_cells in zip(matrix[header_count:], origin_matrix[header_count:]):
+            rendered = []
+            seen = {}
+            for column, (value, source_cell) in enumerate(zip(values, source_cells), start=1):
+                if value and source_cell in seen:
+                    # Keep horizontal span relationships local to the intact row
+                    # without copying long disclosures into every covered column.
+                    rendered.append(f"[merged with column {seen[source_cell]}]")
+                else:
+                    rendered.append(value)
+                    if value:
+                        seen[source_cell] = column
+            md_rows.append("| " + " | ".join(rendered) + " |")
+        return "\n\n" + "\n\n".join(context + ["\n".join(md_rows)]) + "\n\n"
 
-        if not header_processed and md_rows:
-            first_row = md_rows[0]
-            num_cols = first_row.count("|") - 1
-            separator = "| " + " | ".join(["---"] * num_cols) + " |"
-            md_rows.insert(1, separator)
+    def convert_td(self, el, text=None, *args, **kwargs):
+        return text or ""
 
-        return "\n" + "\n".join(md_rows) + "\n\n"
+    convert_th = convert_td
+
+    def convert_sup(self, el, text=None, *args, **kwargs):
+        marker = (text or "").strip()
+        if not marker:
+            return ""
+        return marker if marker.startswith(("(", "[")) else f"[{marker}]"
 
     def convert_img(self, el, text=None, *args, **kwargs):
         """Handle <img> tags in SEC filings.
@@ -128,27 +247,10 @@ class SECMarkdownConverter(MarkdownConverter):
         return "\n---\n"
 
 
-def _ocr_image(image, ocr_engine: str, easyocr_reader=None):
-    """Run OCR on a PIL Image and return extracted text.
-
-    Args:
-        image: PIL Image (already rotated/scaled as needed)
-        ocr_engine: "easyocr" or "pytesseract"
-        easyocr_reader: Initialized easyocr.Reader (required if engine is easyocr)
-
-    Returns:
-        Extracted text string, or empty string on failure.
-    """
-    import numpy as np
-
-    img_array = np.array(image)
-
-    if ocr_engine == "easyocr":
-        results = easyocr_reader.readtext(img_array, detail=0)
-        return " ".join(results).strip()
-    else:
-        import pytesseract
-        return pytesseract.image_to_string(image, config="--psm 7").strip()
+def _ocr_image(image):
+    """Run the locally installed Tesseract engine; never download models."""
+    import pytesseract
+    return pytesseract.image_to_string(image, config="--psm 7").strip()
 
 
 def _clean_ocr_text(text: str) -> str:
@@ -161,131 +263,145 @@ def _clean_ocr_text(text: str) -> str:
     """
     # Fix misread periods (colon/underscore followed by optional stray digits before a capital)
     text = re.sub(r"(\w)[_:]\s*\d*\s+(?=[A-Z])", r"\1. ", text)
-    # Strip leading/trailing non-alpha noise (but keep periods in names)
-    text = re.sub(r"^[^A-Za-z]+", "", text)
-    text = re.sub(r"[^A-Za-z.]+$", "", text)
+    # Years, currency symbols and footnote markers can be meaningful headers.
+    text = re.sub(r"^[^\w$€£(]+", "", text)
+    text = re.sub(r"[^\w.)%]+$", "", text)
     return text.strip()
 
 
 def resolve_rotated_text_images(
     soup: BeautifulSoup,
-    base_url: str,
-    user_agent: str = "SEC-Connector/1.0 (sec-connector@example.com)",
+    image_dir: Path,
 ) -> int:
-    """Download and OCR rotated-text images, replacing them with extracted text in the DOM.
+    """OCR predownloaded adjacent assets only, failing explicitly on missing inputs.
 
-    SEC filings commonly render vertically-oriented table column headers as small
-    JPG images (e.g., director names rotated 90°). This function detects those
-    images, downloads them from SEC, rotates and upscales them, then OCRs the text.
-
-    Requires: Pillow + (easyocr or pytesseract with Tesseract installed).
-    If dependencies are missing, returns 0 (graceful degradation).
-
-    Args:
-        soup: Parsed BeautifulSoup DOM (modified in place)
-        base_url: Base URL for resolving relative image src paths
-        user_agent: User-Agent header for SEC requests
-
-    Returns:
-        Number of images successfully resolved.
+    Pillow, pytesseract and a local Tesseract executable are required when a
+    rotated image is present. Remote URLs and paths outside image_dir are rejected;
+    all downloads belong to SECClient, not the parser.
     """
-    try:
-        from io import BytesIO
-        from PIL import Image
-        import requests as sync_requests
-    except ImportError:
-        logger.debug("Pillow not available — skipping rotated text image resolution")
-        return 0
+    from urllib.parse import unquote, urlsplit
 
-    # Try to import an OCR engine (easyocr preferred, pytesseract as fallback)
-    ocr_engine = None
-    easyocr_reader = None
-    try:
-        import easyocr
-        easyocr_reader = easyocr.Reader(["en"], verbose=False)
-        ocr_engine = "easyocr"
-    except ImportError:
-        try:
-            import pytesseract  # noqa: F401
-            ocr_engine = "pytesseract"
-        except ImportError:
-            logger.debug("No OCR engine available (install easyocr or pytesseract)")
-            return 0
-
-    # Collect rotated-text images before iterating (avoid mutating during traversal)
-    rotated_imgs = [
-        img for img in soup.find_all("img")
-        if _is_rotated_text_image(img) and img.get("src")
-    ]
-
+    rotated_imgs = [img for img in soup.find_all("img") if _is_rotated_text_image(img)]
     if not rotated_imgs:
         return 0
+    root = Path(image_dir).resolve()
+    assets = []
+    for img in rotated_imgs:
+        src = str(img.get("src", ""))
+        url = urlsplit(src)
+        if not src or url.scheme or url.netloc:
+            raise ValueError(f"OCR requires a predownloaded local image, not {src!r}")
+        asset = (root / unquote(url.path)).resolve()
+        if not asset.is_relative_to(root) or not asset.is_file():
+            raise ValueError(f"OCR local image missing or outside image directory: {src!r}")
+        assets.append(asset)
 
-    logger.info(f"Found {len(rotated_imgs)} rotated-text images, resolving with {ocr_engine}")
+    try:
+        from PIL import Image
+        import pytesseract  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("OCR requires Pillow, pytesseract and a local Tesseract executable") from exc
 
     resolved = 0
-    session = sync_requests.Session()
-    session.headers["User-Agent"] = user_agent
-
-    for img_tag in rotated_imgs:
-        src = img_tag["src"]
-
-        # Build absolute URL
-        img_url = src if src.startswith("http") else base_url.rstrip("/") + "/" + src
-
+    for img_tag, asset in zip(rotated_imgs, assets):
         try:
-            resp = session.get(img_url, timeout=10)
-            resp.raise_for_status()
-
-            image = Image.open(BytesIO(resp.content))
-
-            # Rotate 90° clockwise (text is rendered bottom-to-top)
-            rotated = image.rotate(-90, expand=True)
-
-            # Upscale tiny images for better OCR accuracy
+            with Image.open(asset) as image:
+                rotated = image.rotate(-90, expand=True)
             w, h = rotated.size
             if h < 100:
                 scale = max(3, 100 // h)
-                rotated = rotated.resize((w * scale, h * scale), Image.LANCZOS)
-
-            text = _ocr_image(rotated, ocr_engine, easyocr_reader)
-
-            if text and len(text) > 1:
-                text = _clean_ocr_text(text)
-                img_tag.replace_with(text)
-                logger.info(f"OCR resolved: {src} -> '{text}'")
-                resolved += 1
-            else:
-                logger.debug(f"OCR returned empty for {src}")
-        except Exception as e:
-            logger.debug(f"Failed to OCR {src}: {e}")
-
-    session.close()
+                rotated = rotated.resize((w * scale, h * scale), Image.Resampling.LANCZOS)
+            text = _clean_ocr_text(_ocr_image(rotated))
+            if not text:
+                raise ValueError("OCR returned no usable text")
+            img_tag.replace_with(text)
+            resolved += 1
+        except Exception as exc:
+            raise RuntimeError(f"Failed to OCR local image {asset.name}: {exc}") from exc
     return resolved
 
 
-def html_to_markdown(html: str, base_url: Optional[str] = None) -> str:
+def _remove_hidden_content(soup: BeautifulSoup) -> None:
+    """Apply hidden selectors while classes/styles and inline XBRL still exist."""
+    hidden_css = re.compile(
+        r"(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse)|"
+        r"content-visibility\s*:\s*hidden)\s*(?:!important\s*)?(?:;|$)",
+        re.IGNORECASE,
+    )
+    hidden = []
+    ix_prefixes = {"ix"}
+    for tag in soup.find_all(True):
+        ix_prefixes.update(
+            key.split(":", 1)[1] for key, value in tag.attrs.items()
+            if key.startswith("xmlns:") and "inlinexbrl" in str(value).lower()
+        )
+    for style in soup.find_all("style"):
+        css = re.sub(r"/\*.*?\*/", "", style.get_text(), flags=re.DOTALL)
+        for selectors, declarations in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+            if hidden_css.search(declarations):
+                try:
+                    hidden.extend(soup.select(selectors.strip()))
+                except SelectorSyntaxError:
+                    logger.warning("Unsupported CSS selector while removing hidden content: %s", selectors.strip())
+    for tag in soup.find_all(True):
+        if (
+            tag.has_attr("hidden")
+            or str(tag.get("aria-hidden", "")).lower() == "true"
+            or hidden_css.search(str(tag.get("style", "")))
+            or (":" in tag.name and tag.name.split(":")[-1].lower() in {"header", "hidden"}
+                and tag.name.split(":")[0] in ix_prefixes)
+        ):
+            hidden.append(tag)
+    for tag in hidden:
+        if tag.parent is not None:
+            tag.decompose()
+
+
+def html_to_markdown(
+    html: str,
+    base_url: Optional[str] = None,
+    *,
+    local_image_dir: Optional[Path] = None,
+) -> str:
     """Convert HTML content to Markdown.
 
     Args:
         html: HTML content string
-        base_url: Optional base URL for resolving image sources for OCR.
-                  If provided and OCR dependencies are installed, rotated-text
-                  images will be resolved to actual text.
+        base_url: Deprecated; remote OCR is rejected. Use local_image_dir.
+        local_image_dir: Enable OCR using only predownloaded images in this directory.
 
     Returns:
         Markdown formatted string
     """
-    soup = BeautifulSoup(html, "lxml")
+    if base_url is not None:
+        raise ValueError("Remote OCR is not supported; supply local_image_dir with predownloaded assets")
+    html = re.sub(r"^\s*<\?xml\b.*?\?>", "", html, count=1, flags=re.IGNORECASE | re.DOTALL)
+    soup = BeautifulSoup(_clean_page_markers(html), "lxml")
+    _remove_hidden_content(soup)
 
     for tag in soup.find_all(["script", "style", "meta", "link"]):
         tag.decompose()
 
-    # Resolve rotated text images via OCR before stripping styles
-    if base_url:
-        resolve_rotated_text_images(soup, base_url)
+    if local_image_dir is not None:
+        resolve_rotated_text_images(soup, local_image_dir)
 
     for tag in soup.find_all(True):
+        style = tag.get("style", "")
+        if re.search(r"(?:page-break-before|break-before)\s*:\s*(?:always|page|left|right)", style, re.IGNORECASE):
+            tag.insert_before(NavigableString("\n\n---PAGE---\n\n"))
+        if re.search(r"(?:page-break-after|break-after)\s*:\s*(?:always|page|left|right)", style, re.IGNORECASE):
+            tag.insert_after(NavigableString("\n\n---PAGE---\n\n"))
+        if tag.name in {"p", "div"} and not tag.find(["p", "div", "table"]):
+            label = tag.get_text(" ", strip=True)
+            if len(label) <= 180 and re.match(
+                r"^(?:ITEM\s+\d+[A-Z]?[.:]\s+\S|PART\s+[IVX]+\b)", label, re.IGNORECASE
+            ):
+                tag.name = "h2"
+            elif not tag.find_parent("table") and len(label) <= 180 and re.search(r"[A-Za-z]", label):
+                bold = tag.find(["b", "strong"])
+                if ((bold and bold.get_text(" ", strip=True) == label)
+                    or re.search(r"font-weight\s*:\s*(?:bold|[6-9]00)", style, re.IGNORECASE)):
+                    tag.name = "h3"
         if tag.get("style") and tag.name != "img":
             del tag["style"]
         if tag.get("class"):
@@ -379,21 +495,17 @@ def clean_sec_text(text: str) -> str:
     text = re.sub(r"&gt;", ">", text, flags=re.IGNORECASE)
     text = re.sub(r"&quot;", '"', text, flags=re.IGNORECASE)
 
-    text = re.sub(r"<PAGE>\s*", "\n\n---PAGE---\n\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"-----+\s*PAGE\s*-----+", "\n\n---PAGE---\n\n", text, flags=re.IGNORECASE)
+    text = _clean_page_markers(text)
 
     text = re.sub(r"<[A-Z]+>(?=\s*\n)", "", text)
 
     return text
 
 
-def _build_filing_base_url(filing: FilingMetadata) -> str:
-    """Build the SEC base URL for a filing's directory (used to resolve image src paths).
-
-    Example: https://www.sec.gov/Archives/edgar/data/713676/000119312525052937/
-    """
-    accession_no_dashes = filing.accession_number.replace("-", "")
-    return f"https://www.sec.gov/Archives/edgar/data/{filing.cik}/{accession_no_dashes}/"
+def _clean_page_markers(text: str) -> str:
+    """Normalize SEC markers without decoding literal escaped HTML into tags."""
+    text = re.sub(r"<PAGE>\s*", "\n\n---PAGE---\n\n", text, flags=re.IGNORECASE)
+    return re.sub(r"-----+\s*PAGE\s*-----+", "\n\n---PAGE---\n\n", text, flags=re.IGNORECASE)
 
 
 def parse_document(
@@ -401,6 +513,8 @@ def parse_document(
     filing: FilingMetadata,
     document: DocumentInfo,
     ocr_images: bool = False,
+    *,
+    local_image_dir: Optional[Path] = None,
 ) -> Optional[ParsedDocument]:
     """Parse a downloaded document file.
 
@@ -408,9 +522,9 @@ def parse_document(
         file_path: Path to downloaded file
         filing: Filing metadata
         document: Document info
-        ocr_images: If True, download and OCR rotated-text images to recover
-                    text (e.g., vertical column headers rendered as images).
-                    Requires easyocr or pytesseract.
+        ocr_images: OCR rotated text using predownloaded assets only. Missing
+                    images/dependencies or failed OCR raise explicit errors.
+        local_image_dir: Image directory; defaults to file_path.parent.
 
     Returns:
         ParsedDocument or None if parsing fails
@@ -421,25 +535,39 @@ def parse_document(
         logger.error(f"Failed to read {file_path}: {e}")
         return None
 
-    base_url = _build_filing_base_url(filing) if ocr_images else None
+    if re.search(r"<DOCUMENT\s*>", content, re.IGNORECASE):
+        documents = extract_sgml_documents(content)
+        matches = [
+            candidate for candidate in documents
+            if candidate["filename"] == document.filename
+            and candidate["sequence"].isdigit()
+            and int(candidate["sequence"]) == document.sequence
+            and candidate["type"].casefold() == document.document_type.casefold()
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"SGML document selection requires exactly one match for "
+                f"{document.filename!r}, sequence {document.sequence}, "
+                f"type {document.document_type!r}; found {len(matches)}"
+            )
+        content = matches[0]["text"]
 
-    if file_path.suffix.lower() in [".htm", ".html"]:
-        content = clean_sec_text(content)
-        markdown = html_to_markdown(content, base_url=base_url)
-    elif file_path.suffix.lower() == ".txt":
-        if "<html" in content.lower() or "<body" in content.lower():
-            content = clean_sec_text(content)
-            markdown = html_to_markdown(content, base_url=base_url)
-        else:
-            content = clean_sec_text(content)
-            markdown = content
+    is_html = file_path.suffix.lower() in {".htm", ".html"} or re.search(
+        r"<(?:html|head|body|table|p|div|span|img|br|pre|ul|ol|li|h[1-6]|ix:[\w-]+)(?:\s|/?>)",
+        content, re.IGNORECASE,
+    )
+    if is_html:
+        markdown = html_to_markdown(
+            content,
+            local_image_dir=(local_image_dir or file_path.parent) if ocr_images else None,
+        )
     else:
-        markdown = content
+        markdown = clean_sec_text(content)
 
     markdown = re.sub(r"\n{4,}", "\n\n\n", markdown)
 
-    if len(markdown.strip()) < 100:
-        logger.warning(f"Document too short after parsing: {file_path}")
+    if not markdown.strip():
+        logger.warning(f"Document empty after parsing: {file_path}")
         return None
 
     return ParsedDocument(

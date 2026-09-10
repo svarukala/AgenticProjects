@@ -178,8 +178,8 @@ source venv/bin/activate
 # Install in development mode
 pip install -e .
 
-# Or install dependencies only
-pip install -r requirements.txt
+# Or install a built wheel, including the bundled configuration and schema
+pip install dist\sec_connector-1.0.0-py3-none-any.whl
 ```
 
 ### Step 4: Verify Installation
@@ -222,6 +222,7 @@ Set the Azure credentials as environment variables:
 $env:AZURE_TENANT_ID = "your-tenant-id"
 $env:AZURE_CLIENT_ID = "your-client-id"
 $env:AZURE_CLIENT_SECRET = "your-client-secret"
+$env:SEC_USER_AGENT = "YourOrganization SEC-Connector (real-contact@your-organization.com)"
 ```
 
 #### Windows (PowerShell) - Permanent
@@ -230,6 +231,7 @@ $env:AZURE_CLIENT_SECRET = "your-client-secret"
 [Environment]::SetEnvironmentVariable("AZURE_TENANT_ID", "your-tenant-id", "User")
 [Environment]::SetEnvironmentVariable("AZURE_CLIENT_ID", "your-client-id", "User")
 [Environment]::SetEnvironmentVariable("AZURE_CLIENT_SECRET", "your-client-secret", "User")
+[Environment]::SetEnvironmentVariable("SEC_USER_AGENT", "YourOrganization SEC-Connector (real-contact@your-organization.com)", "User")
 ```
 
 #### macOS/Linux
@@ -238,6 +240,7 @@ $env:AZURE_CLIENT_SECRET = "your-client-secret"
 export AZURE_TENANT_ID="your-tenant-id"
 export AZURE_CLIENT_ID="your-client-id"
 export AZURE_CLIENT_SECRET="your-client-secret"
+export SEC_USER_AGENT="YourOrganization SEC-Connector (real-contact@your-organization.com)"
 
 # Add to ~/.bashrc or ~/.zshrc for persistence
 ```
@@ -248,12 +251,12 @@ export AZURE_CLIENT_SECRET="your-client-secret"
 # Windows PowerShell
 echo $env:AZURE_TENANT_ID
 echo $env:AZURE_CLIENT_ID
-echo $env:AZURE_CLIENT_SECRET
+Write-Output "Client secret configured: $([bool]$env:AZURE_CLIENT_SECRET)"
 
 # macOS/Linux
 echo $AZURE_TENANT_ID
 echo $AZURE_CLIENT_ID
-echo $AZURE_CLIENT_SECRET
+test -n "$AZURE_CLIENT_SECRET" && echo "Client secret configured"
 ```
 
 ### Step 3: Configuration File (Optional)
@@ -262,36 +265,54 @@ The default configuration is in `config/config.yaml`. You can customize:
 
 ```yaml
 sec:
-  user_agent: "SEC-Connector/1.0 (your-email@example.com)"  # Update with your email
+  user_agent: ${SEC_USER_AGENT}  # Real organization/contact; placeholders fail before networking
   rate_limit: 10  # SEC API rate limit (requests/second)
 
 azure:
   tenant_id: ${AZURE_TENANT_ID}
   client_id: ${AZURE_CLIENT_ID}
   client_secret: ${AZURE_CLIENT_SECRET}
-  connection_id: "pysecfilings"           # Default, can be overridden via CLI
-  connection_name: "SEC EDGAR Filings"    # Display name in Microsoft 365 Admin Center
+  connection_id: "secedgar20260909v2"      # Can be overridden via CLI
+  connection_name: "SEC EDGAR Filings v2"
   connection_description: "SEC EDGAR filings including 10-K, 10-Q, 8-K, and DEF 14A forms"
 
 filings:
   forms: ["10-K", "10-Q", "8-K", "DEF 14A"]  # Filing types to process
+  include_history: true
+  include_amendments: true
+  include_exhibits: true
+  exhibit_types: ["EX-99", "EX-10", "EX-21"]
+  start_date: null
+  end_date: null
+
+sync:
+  refresh_downloads: true
+  prune_missing_filings: false
 
 chunking:
   target_size: 4000   # Target chunk size (characters)
   max_size: 8000      # Maximum chunk size
   overlap: 200        # Overlap between chunks
+  max_item_bytes: 31457280  # 30 MiB maximum serialized external-item request
 
 processing:
   concurrent_downloads: 5   # Parallel SEC downloads
-  batch_size: 20            # Items per Graph API batch upload
-  ocr_images: true          # OCR rotated-text images (e.g., vertical column headers)
+  batch_size: 20            # Work grouping; individual PUT concurrency is capped at 5
+  ocr_images: false         # Explicit opt-in; requires local image assets and OCR prerequisites
 
 test_mode:
   max_filings: 2      # Filings per ticker in test mode
   max_pages: 5        # Pages per filing in test mode
 ```
 
-> **OCR Note**: When `ocr_images` is `true` (or the `--ocr` CLI flag is used), the parser downloads images referenced in SEC filings and runs OCR to recover text from rotated-text images. This is common in financial tables where column headers are rendered as rotated image labels (which would otherwise appear as `LOGO` placeholders). Requires `easyocr` or `pytesseract` to be installed.
+> **OCR Note**: OCR is opt-in. The parser does not download images or models. Missing prerequisites or referenced local assets fail explicitly instead of silently omitting text. See the OCR section below.
+
+Discovery reads recent submissions and every historical submissions file before
+sorting and applying a filing limit. Filing-detail tables supply authoritative
+document sequences and exhibit types. Unsupported binaries are explicitly logged
+as excluded; a missing or unsupported primary document fails the filing.
+Source requests and retries share a paced SEC limiter. Coordinate separate
+connector processes so their combined traffic stays within SEC's limit.
 
 ---
 
@@ -305,26 +326,8 @@ Run the setup command to create the Microsoft Graph connection and schema:
 sec-connector setup
 ```
 
-You'll be prompted to enter a connector name. The connection ID is derived automatically:
-
-```
-Graph Connector Configuration
-The connection name identifies your connector in Microsoft 365.
-The connection ID (alphanumeric) is derived automatically.
-
-Enter a name for your connector [SEC Filings]: My SEC Filings
-
-  Connection name: My SEC Filings
-  Connection ID:   mysecfilings
-
-Use this connection? [Y/n]: y
-Connection name: My SEC Filings
-Connection ID:   mysecfilings
-Setting up Graph connector...
-Waiting for schema to be ready (this may take a few minutes)...
-Schema is ready
-Setup complete! Connection is ready.
-```
+Setup uses the connection ID and display name in the configuration, just like
+ingest and resume. It no longer prompts for a temporary, unpersisted destination.
 
 You can also provide the connection name and ID directly via CLI options:
 
@@ -336,7 +339,47 @@ sec-connector setup --connection-name "PNC SEC Filings" -n pncsecfilings
 sec-connector setup -n mysecfilings
 ```
 
-**Note**: Schema provisioning can take 2-5 minutes. The command will wait automatically.
+**Note**: Schema provisioning can take 5-15 minutes. Setup follows the operation
+returned by Graph's v1.0 API and reports terminal errors or timeout. An existing
+schema is reused only when it matches the requested schema.
+The canonical `config/schema.json` defines 22 properties: document/file provenance,
+refinable ticker/form/document type, reporting/acceptance dates, amendment flag,
+chunk ordinal, and section title supplement the original content metadata.
+`Url` cites the actual primary/exhibit document; `FilingUrl` cites its filing index.
+Semantic labels include title, URL, file name/extension, icon, and creation time.
+Stable v1.0 is used: `iconUrl` readback requires `Prefer: include-unknown-enum-members`,
+and the beta-only `isExactMatchRequired` flag is intentionally excluded.
+Schema changes on a locally populated destination require a new connection ID in
+this release, so existing completed records cannot incorrectly suppress required
+reingestion. If Graph reports a missing connection while local records remain,
+setup stops; explicitly reset that destination before recreating it.
+
+### Upgrading an existing installation
+
+State is now stored in `data/state.<destination-hash>.db`, derived from the
+configured database path, tenant ID, and connection ID. The database also stores
+and checks its destination identity. Ingest, resume, status, and reset acquire an
+exclusive process lock; a crash releases the lock automatically.
+
+**Legacy `data/state.db` cannot be automatically adopted:** its records do not
+identify the tenant/connection and do not contain replayable upload payloads.
+Commands refuse to operate while the configured legacy path exists. Explicitly
+remove it if it is disposable, or move it out of the configured path if you need
+to retain it, then use a **new connection ID** for reingestion. Retire the previous
+connection deliberately; deleting local state does not delete remote content.
+Do not simply rename the old database to a destination-hashed filename.
+
+The new item identity preserves ordinary unsplit IDs and adds a unique subchunk
+suffix where needed. Changed partition boundaries can leave old IDs in a reused
+connection, which is another reason to use a new connection for this upgrade.
+Subsequent full ingests reconcile changed boundaries and remove obsolete tracked
+items only after every desired item has been acknowledged.
+
+The 30 MB service ceiling is configured as 30 MiB (31,457,280 bytes). The exact
+UTF-8 JSON body, including properties and ACLs, is checked before upload and those
+same bytes are sent. Character chunking defaults remain 4,000/8,000 characters;
+raising the envelope does not force every item to be 30 MB. Oversized final
+payloads fail explicitly rather than being sent or silently dropped.
 
 ### Step 2: Test with a Single Ticker
 
@@ -436,17 +479,94 @@ Processing Status:
 └──────────┴────────┘
 ```
 
-### Step 5: Resume Failed Uploads
+### Step 5: Resume Interrupted Processing
 
-If any uploads failed (e.g., due to network issues), resume them:
+Resume recovers discovery/download/parse failures even if no chunks were created,
+as well as pending/failed uploads. The document inventory and successful parsed
+payloads are checkpointed. Prepared payloads are replayed unchanged; changes to
+chunking or OCR settings do not alter an in-flight filing.
+
+Both `ingest` and `resume` honor inclusive `filings.start_date` and
+`filings.end_date` bounds using the SEC filing date, not the fiscal reporting
+period. A fixed `start_date: "2019-09-09"` limits this backfill to the seven-year
+window as of September 9, 2026; it is not an automatically advancing cutoff.
+To narrow an active backfill, stop it before changing configuration, then resume.
+Resume leaves out-of-window queued filings and any previously uploaded content
+untouched, while retaining captured document-selection and processing settings
+for eligible filings. Out-of-window rows remain visible as pending in total
+database counts; removing the date bound makes them eligible again.
 
 ```powershell
-# Resume with OCR (if not enabled in config)
-sec-connector resume -n mysecfilings --ocr
+# Resume with the filing's captured processing settings
+sec-connector resume -n mysecfilings
 
 # Resume with payload saving
 sec-connector resume -n mysecfilings --save-payloads
 ```
+
+Missing downloads, empty/unreadable documents, and empty inventories are failures,
+not successful exclusions. Filings complete only after every selected document
+has a prepared manifest and every expected item is acknowledged. A sampled filing
+is recorded as `sampled`, never `completed`; `--max-pages` limits the total chunks
+across the filing's documents. A later unlimited ingest expands a sample.
+Completed filings are refreshed on repeated full ingests. SHA-256 fingerprints
+cover source bytes, metadata, selection/processing settings, schema, and processing
+version. Unchanged documents reuse prepared payloads; unchanged item hashes skip
+Graph PUTs. Setting `sync.refresh_downloads: false` trusts valid local cached bytes
+and will not detect same-size source changes.
+
+Desired uploads finish before obsolete chunks or removed exhibits are deleted.
+Failed deletions remain resumable. Sampled runs never delete stale content or
+downgrade a completed filing. In-flight manifests retain their captured settings;
+restore those settings if discovery/schema changed before preparation finished.
+
+For a parser or chunker upgrade, stop the active writer before deploying the
+change. Ordinary `resume` replays saved payloads; it does not repair content
+already prepared with the old parser. Use an explicit, ticker-scoped rebuild:
+
+```powershell
+sec-connector ingest -t WFC --reprocess -n mysecfilings
+```
+
+`--reprocess` rebuilds selected filings with current processing settings, including
+interrupted manifests. The configured filing-date bounds still apply. It retains
+acknowledged IDs and separately tracks old IDs that might have reached Graph
+before an interrupted acknowledgment. Replacement uploads must succeed before
+obsolete IDs are deleted; parse/upload failures leave old content tracked for
+recovery. Do not combine a full-content repair with sampling limits. Other
+tickers and out-of-window rows are not rebuilt. A code upgrade alone does not
+repair previously indexed content for companies that are not reprocessed.
+
+Financial table normalization removes empty visual spacer rows and collapses
+columns only when the HTML source cells establish that they are the same layout
+column. Equal numbers in independent columns are never deduplicated. A body cell
+spanning distinct logical columns is printed once, with `[merged with column N]`
+in the other covered positions; this refers to the **same row**, not another
+search result. Row-spanning labels and financial column headers are retained.
+Year-containing narrative disclosures are not treated as date headers.
+
+Table rows and headers stay together when they fit the configured chunk budget.
+Genuinely oversized rows/header blocks still produce explicit fragmentation
+warnings; normalization is not a guarantee that every possible source table can
+fit. Investigate those warnings rather than assuming independently retrieved
+fragments will be recombined by an agent.
+
+Whole-filing deletion is **off by default**. `ingest --prune` (or
+`sync.prune_missing_filings: true`) removes tracked filings missing from the
+selected complete historical inventory, including filings excluded by changed
+form/amendment policy. Pruning rejects test mode, filing/chunk limits, recent-only
+discovery, and date bounds. A ticker's processing errors block its pruning.
+There is no arbitrary single-accession delete command.
+
+`status` includes acknowledged item count and durable last-run outcome. Repeated
+`ingest` calls provide synchronization; use your scheduler for periodic runs.
+
+Ingest/resume return a nonzero exit code when work has errors. Graph write
+acknowledgments are not proof of immediate search visibility.
+
+Reset clears only the selected destination's state after Graph acknowledges
+deletion (or returns confirmed not-found). Any other remote failure preserves the
+database. The destination binding and lock file remain for safe reuse.
 
 ---
 
@@ -455,7 +575,7 @@ sec-connector resume -n mysecfilings --save-payloads
 ### Basic Commands
 
 ```powershell
-# Setup a new connector (interactive prompt)
+# Setup the configured connector
 sec-connector setup
 
 # Setup with explicit name and ID
@@ -510,7 +630,8 @@ sec-connector ingest -t AAPL --test --ocr --save-payloads -n mysecfilings
 
 ### OCR for Rotated-Text Images
 
-SEC filings often contain financial tables where column headers are rendered as rotated images (appearing as `LOGO` in raw output). The OCR feature downloads these images and extracts the actual text.
+SEC filings sometimes render column labels as images. OCR extracts text from
+local assets only; it is not a general automatic SEC image downloader.
 
 **Enable via config (persistent):**
 ```yaml
@@ -522,16 +643,15 @@ processing:
 **Enable via CLI flag (per-run):**
 ```powershell
 sec-connector ingest -t AAPL -n mysecfilings --ocr
-sec-connector resume -n mysecfilings --ocr
+# Resume always uses the manifest's captured OCR choice
+sec-connector resume -n mysecfilings
 ```
 
-**Requirements**: Install one of the supported OCR backends:
+**Requirements**: Install the OCR dependencies and local engine/assets described
+by the parser. OCR never silently falls back to a network download.
 ```powershell
-# Option 1: EasyOCR (recommended, pure Python)
-pip install easyocr
-
-# Option 2: pytesseract (requires Tesseract binary)
-pip install pytesseract
+pip install -e ".[ocr]"
+# Install Tesseract separately and make it available on PATH.
 ```
 
 ### Popular Ticker Symbols
@@ -619,7 +739,7 @@ sec-connector resume -n mysecfilings --ocr
 
 **Cause**: Microsoft Graph schema provisioning can take several minutes.
 
-**Solution**: Wait up to 5 minutes. If it times out:
+**Solution**: Wait up to 15 minutes. If it times out:
 ```powershell
 # Run setup again - it will detect existing schema
 sec-connector setup -n mysecfilings
@@ -690,15 +810,20 @@ sec-connector ingest -t AAPL -n mysecfilings
 
 ### Q: How do I delete specific filings?
 
-**A**: Currently, use the reset command to delete all, then re-ingest what you need.
+**A**: Use the guarded complete-inventory `--prune` policy described above for
+filings no longer selected. Reset deletes the entire selected connection.
 
 ### Q: What does the `--ocr` flag do?
 
-**A**: Many SEC financial tables have column headers rendered as rotated images (they show up as `LOGO` in the parsed output). The `--ocr` flag downloads those images from SEC.gov and runs OCR to recover the actual text (e.g., "Total Assets", "Net Income"). This significantly improves the quality of indexed content for financial tables. You can enable it permanently by setting `ocr_images: true` in `config/config.yaml`.
+**A**: It enables explicit local-image OCR. It requires installed OCR dependencies,
+an available engine, and referenced local assets. It never makes unthrottled
+network requests. Missing prerequisites fail rather than claiming complete coverage.
 
 ### Q: What is the difference between `--connection-id` and `--connection-name`?
 
-**A**: The `--connection-id` (`-n`) is the alphanumeric identifier used by the Graph API (e.g., `pncsecfilings`). The `--connection-name` is the human-readable display name shown in the Microsoft 365 Admin Center (e.g., `PNC SEC Filings`). During interactive setup, both are derived from your input. Via CLI flags, you can set them independently.
+**A**: The `--connection-id` (`-n`) is the alphanumeric API identifier. The
+`--connection-name` is its display name. Setup uses configuration unless explicitly
+overridden; use the same connection ID for subsequent commands.
 
 ### Q: What does `--save-payloads` do?
 

@@ -1,5 +1,5 @@
 sec:
-  user_agent: "SEC-Connector/1.0 (your-email@example.com)"
+  user_agent: ${SEC_USER_AGENT}
   rate_limit: 10
   base_url: "https://www.sec.gov"
   data_url: "https://data.sec.gov"
@@ -8,23 +8,33 @@ azure:
   tenant_id: ${AZURE_TENANT_ID}
   client_id: ${AZURE_CLIENT_ID}
   client_secret: ${AZURE_CLIENT_SECRET}
-  connection_id: "pysecfilings"
-  connection_name: "SEC EDGAR Filings"
-  connection_description: "SEC EDGAR filings including 10-K, 10-Q, 8-K, and DEF 14A forms"
+  connection_id: "secedgar20260909v2"
+  connection_name: "SEC EDGAR Filings v2"
+  connection_description: "Public SEC EDGAR annual and quarterly reports, current reports, proxy statements, amendments and selected exhibits. Find company disclosures by issuer, ticker, form, filing date and reporting period; analyze financial statements and cite the original SEC document."
+  icon_url: "https://www.sec.gov/favicon.ico"
 
 filings:
   forms: ["10-K", "10-Q", "8-K", "DEF 14A"]
+  start_date: "2019-09-09"  # Seven-year cutoff for the current backfill; filing date, inclusive
+  include_history: true
+  include_amendments: true
+  include_exhibits: true
+  exhibit_types: ["EX-99", "EX-10", "EX-21"]
 
 chunking:
   target_size: 4000
   max_size: 8000
   overlap: 200
-  max_item_bytes: 4194304  # 4 MB hard limit for Graph
+  max_item_bytes: 31457280  # 30 MiB ceiling, checked against the serialized Graph request
 
 processing:
   concurrent_downloads: 5
   batch_size: 20
-  ocr_images: true  # Set true or use --ocr flag to OCR rotated-text images (requires easyocr or pytesseract)
+  ocr_images: false  # Enable explicitly after installing OCR prerequisites
+
+sync:
+  refresh_downloads: true
+  prune_missing_filings: false  # Only enable for an explicitly complete historical crawl
 
 test_mode:
   max_filings: 2
